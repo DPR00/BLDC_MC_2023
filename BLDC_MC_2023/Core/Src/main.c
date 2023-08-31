@@ -22,6 +22,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "PID.h"
+#include <math.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -34,15 +35,15 @@
 
 // Definiciones principales
 #define POLE_PAIRS 23u
-#define VOLTAJE 48u
+#define VOLTAGE 48u
 #define STEP_ADC_RPM 10u
 #define ESTIMATION_RATE 5u // solo puede ser divisor de 10 {1, 2, 5, 10}.
 
 #define STEPS2RPM 60*ESTIMATION_RATE/POLE_PAIRS/6 // 60 segundos, 2 Hz, 23 pp, 6 pasos
 #define RPM2KMH 1/10.44
-#define SPEED_UNITS 0u		// 0 for RPM, 1 for KMH
+#define SPEED_UNITS 1u		// 0 for RPM, 1 for KMH
 #define TELEMETRY 0u		  // 0 for normal operation, 1 for telemetry
-#define PID 0u				// 0 for normal operation, 1 for PID longitudinal control
+#define PID 1u				// 0 for normal operation, 1 for PID longitudinal control
 
 #define LONGITUDINAL_CAN_ID 255u  // ID decimal para la trama del control longitudinal
 #define LATERAL_CAN_ID 253u       // ID decimal para la trama del control lateral
@@ -50,7 +51,7 @@
 #define HMI_CAN_ID 1u             // ID en decimal del display del volante
 // Definiciones adicionales
 
-#define COMMUTATION_DELAY_US 350u	// microsegundos para el delay
+#define COMMUTATION_DELAY_US 100u	// microsegundos para el delay. PCBv0: 350 us
 
 
 /* Controller parameters */
@@ -66,6 +67,13 @@
 #define PID_LIM_MAX  100.0f
 
 #define SAMPLE_TIME_S 0.1f
+
+/* Desired speeds (rpm)*/
+// Velocidades máximas introducidas por los botones del HMI
+#define MAXVEL_UP_RPM 340.0f
+#define MAXVEL_DOWN_RPM 230.0f
+#define MAXVEL_RIGHT_RPM 261.0f
+#define MAXVEL_LEFT_RPM 251.0f
 
 
 /* CAN data */
@@ -131,7 +139,7 @@ void delay_us (uint16_t us);
 void send_can_data(void);
 
 // VARIABLES
-uint8_t power = 0;
+uint8_t power = 1;
 uint16_t raw_adc = 0;
 uint16_t rate_adc = 0;
 
@@ -146,6 +154,7 @@ uint16_t steps = 0;
 
 float desired_speed_rpm = 0;
 float current_speed_rpm = 0;
+float max_desired_speed_rpm = MAXVEL_RIGHT_RPM; // DEFAULT MAX SPEED
 float error = 0; //difference between desired and measured speed
 float integral = 0;
 uint8_t duty_cycle = 0;
@@ -189,8 +198,7 @@ int main(void)
   /* MCU Configuration--------------------------------------------------------*/
 
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-
-	HAL_Init();
+  HAL_Init();
 
   /* USER CODE BEGIN Init */
 
@@ -257,8 +265,8 @@ int main(void)
   CAN_FLAG_REG = (CAN_FLAG_REG & (~(1 << SU))) | (SPEED_UNITS << SU); // speed unit setting a
   CAN_FLAG_REG &= ~(1<<EM); // No Emergency
   CAN_FLAG_REG &= ~(1<<PW); // Initial OFF
-  CAN_FLAG_REG &= ~(1<<CS0); //
-  CAN_FLAG_REG &= ~(1<<CS1); // Cruise speed
+  CAN_FLAG_REG |=  (1 << CS1);
+  CAN_FLAG_REG &= ~(1 << CS0); //Cruise speed 2 by default
 
 
 
@@ -771,9 +779,13 @@ void get_adc(void){
 //	}
 
 	if (PID){
-		rate_adc = STEP_ADC_RPM*48*12/VOLTAJE;
-		raw_adc = rate_adc*(raw_adc/rate_adc);
-		desired_speed_rpm = raw_adc*STEP_ADC_RPM/rate_adc;
+//		rate_adc = STEP_ADC_RPM*48*12/VOLTAGE; // MAX_VOLTAGE = 48 (FIJO)
+//		raw_adc = rate_adc*(raw_adc/rate_adc);
+//		desired_speed_rpm = raw_adc*STEP_ADC_RPM/rate_adc;
+//		desired_speed_rpm = desired_speed_rpm*max_desired_speed_rpm/340; //
+		float temp_speed_rpm = max_desired_speed_rpm*raw_adc/4095;
+		desired_speed_rpm = STEP_ADC_RPM*ceil(temp_speed_rpm/STEP_ADC_RPM);
+
 	}
 	else {
 		duty_cycle = 100*raw_adc/4095;
@@ -1036,6 +1048,8 @@ void send_can_data(void){
 		// KMPH
 		TxData[0] = current_speed_rpm*RPM2KMH;
 		TxData[1] = 0;
+		TxData[3] = desired_speed_rpm*RPM2KMH;
+		TxData[4] = 0;
 
 	}
 
@@ -1044,8 +1058,6 @@ void send_can_data(void){
 
 	//Enviamos el estado ON OFF del sistema
 	CAN_FLAG_REG = (CAN_FLAG_REG & (~(1 << PW))) | (power << PW); // Sending the ON (1) or OFF (0)
-
-
 	TxData[7] = CAN_FLAG_REG;	// Actualizamos con los flag
 
 	HAL_CAN_AddTxMessage(&hcan, &TxHeader, TxData, &TxMailbox);
@@ -1078,12 +1090,12 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan){
 	HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &RxHeader, RxData);
 
   // Si es que se tiene activada la telemetria y el ID es del axotec
-  if (TELEMETRY && RxHeader.StdId == AXOTEC_ID){
+  if (TELEMETRY && RxHeader.StdId == LONGITUDINAL_CAN_ID){
 	  desired_speed_rpm = RxData[0] + RxData[1];
   }
 
   // Para la data que llega del HMI
-	if (RxData[0] == 96 && RxData[1] == 234){ // HMI Page 60000
+	if (RxHeader.StdId == HMI_CAN_ID && RxData[0] == 96 && RxData[1] == 234){ // HMI Page 60000
 
 		if (RxData[4] == 1){ //HMI button 1
 			power = 1;
@@ -1097,24 +1109,30 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan){
 			//TxData[4] = 0;		//Change button color
 			CAN_FLAG_REG &= ~(1 << CS1);
 			CAN_FLAG_REG &= ~(1 << CS0); //Cruise speed 0
+			max_desired_speed_rpm = MAXVEL_DOWN_RPM;
 
 		}
 		if (RxData[5] == 8){ //HMI left button
 			//TxData[4] = 1; 		//Change button color
 			CAN_FLAG_REG &= ~(1 << CS1);
 			CAN_FLAG_REG |=  (1 << CS0); //Cruise speed 1
+			max_desired_speed_rpm = MAXVEL_LEFT_RPM;
+
 
 		}
 		if (RxData[5] == 32){ //HMI right button
 			//TxData[4] = 2;		//Change button color
 			CAN_FLAG_REG |=  (1 << CS1);
 			CAN_FLAG_REG &= ~(1 << CS0); //Cruise speed 2
+			max_desired_speed_rpm = MAXVEL_RIGHT_RPM;
+
 
 		}
 		if (RxData[5] == 2){ //HMI up button
 			//TxData[4] = 3;		//Change button color
 			CAN_FLAG_REG |=  (1 << CS1);
 			CAN_FLAG_REG |=  (1 << CS0); //Cruise speed 3
+			max_desired_speed_rpm = MAXVEL_UP_RPM;
 
 		}
 
